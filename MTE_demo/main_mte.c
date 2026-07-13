@@ -1,0 +1,399 @@
+/*
+ * =============================================================
+ *        INTENTIONALLY VULNERABLE IOT FIRMWARE - MTE TARGET
+ * =============================================================
+ * Identico all'originale (iot_vuln_demo.c). Nessuna modifica di
+ * logica: il tagging MTE viene attivato a runtime tramite
+ * GLIBC_TUNABLES=glibc.mem.tagging=3, non nel codice.
+ *
+ * Build: aarch64-linux-gnu-gcc -march=armv8.5-a+memtag -g -static
+ * Run:   GLIBC_TUNABLES=glibc.mem.tagging=3 qemu-aarch64 ./demo_mte
+ * =============================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <sys/prctl.h>
+
+/* ---------------------------------------------------------------
+ * Firmware-style constants and data structures
+ * --------------------------------------------------------------- */
+
+
+#define UART_LINE_MAX       18 //should be smthing like 64, for demostration lets say 18
+#define CONFIG_KEY_MAX      16
+#define CONFIG_VAL_MAX      32
+#define CONFIG_MAX_ENTRIES  8
+#define SENSOR_FRAME_MAX    32
+#define OTA_CHUNK_MAX       128
+#define PKT_PAYLOAD_MAX     256
+
+/* Simple key/value config store, as found on many embedded devices */
+typedef struct {
+    char key[CONFIG_KEY_MAX];
+    char value[CONFIG_VAL_MAX];
+    uint8_t in_use;
+} config_entry_t;
+
+static config_entry_t g_config_store[CONFIG_MAX_ENTRIES];
+
+/* Network packet header, as parsed from a raw byte stream */
+typedef struct {
+    uint16_t magic;
+    uint16_t payload_len;   /* attacker/peer controlled */
+    uint8_t  msg_type;
+} pkt_header_t;
+
+/* Sensor frame: fixed binary layout coming from a peripheral bus */
+typedef struct {
+    uint8_t  sensor_id;
+    uint8_t  sample_count;
+    int16_t  samples[8];    /* fixed capacity */
+} sensor_frame_t;
+
+/* Session object representing a connection lifecycle */
+typedef struct {
+    uint32_t session_id;
+    uint8_t  active;
+    char    *rx_buffer;      /* heap-allocated per session */
+    size_t   rx_buffer_len;
+} session_t;
+
+/* OTA metadata describing an incoming firmware chunk */
+typedef struct {
+    uint32_t chunk_offset;
+    uint16_t chunk_len;      /* peer-controlled */
+    uint8_t  data[OTA_CHUNK_MAX];
+} ota_chunk_t;
+
+/* ---------------------------------------------------------------
+ * 1. UART command parsing
+ * BUG: unsafe copy of attacker/peer-controlled line into a fixed
+ *      stack buffer without bounding by sizeof(dest). Classic
+ *      stack buffer overflow via strcpy on unterminated input.
+ * --------------------------------------------------------------- */
+
+void uart_process_line(const char *raw_line)
+{
+    char cmd_buf[UART_LINE_MAX];
+
+    /* Firmware devs often assume UART lines are "always short".
+     * strcpy does not enforce that assumption. */
+    strcpy(cmd_buf, raw_line);   /* VULN: buffer overflow */
+
+    printf("[UART] processed command: %s\n", cmd_buf);
+}
+
+/* ---------------------------------------------------------------
+ * 2. Network packet parsing
+ * BUG: payload_len from the header is trusted directly when
+ *      copying into a fixed-size local buffer -> classic
+ *      out-of-bounds write if payload_len > PKT_PAYLOAD_MAX.
+ * --------------------------------------------------------------- */
+
+void parse_device_message(const uint8_t *packet, size_t packet_len)
+{
+    if (packet_len < sizeof(pkt_header_t)) {
+        printf("[NET] packet too small for header\n");
+        return;
+    }
+
+    pkt_header_t hdr;
+    memcpy(&hdr, packet, sizeof(pkt_header_t));
+
+    uint8_t payload[PKT_PAYLOAD_MAX];
+    const uint8_t *payload_src = packet + sizeof(pkt_header_t);
+
+    /* VULN: hdr.payload_len is peer-controlled and not validated
+     * against PKT_PAYLOAD_MAX or against the actual packet_len. */
+    memcpy(payload, payload_src, hdr.payload_len);
+
+    printf("[NET] msg_type=%u payload_len=%u\n", hdr.msg_type, hdr.payload_len);
+}
+
+/* ---------------------------------------------------------------
+ * 3. Configuration update handling
+ * BUG: linear search finds a free slot but the incoming value
+ *      string is copied with strcpy into a fixed-size field,
+ *      and key comparison reads up to CONFIG_KEY_MAX without
+ *      checking the source is NUL-terminated -> out-of-bounds
+ *      read on key, and overflow on value if too long.
+ * --------------------------------------------------------------- */
+
+void apply_config_update(const char *key, const char *new_value)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < CONFIG_MAX_ENTRIES; i++) {
+        if (!g_config_store[i].in_use) {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        /* VULN: strncmp bound uses struct field size, not the
+         * actual length of 'key', so a short, non-terminated
+         * 'key' buffer from a caller can read past its end. */
+        if (strncmp(g_config_store[i].key, key, CONFIG_KEY_MAX) == 0) {
+            strcpy(g_config_store[i].value, new_value); /* VULN: overflow */
+            printf("[CFG] updated key=%s\n", key);
+            return;
+        }
+    }
+
+    if (free_slot >= 0) {
+        strcpy(g_config_store[free_slot].key, key);       /* VULN: overflow */
+        strcpy(g_config_store[free_slot].value, new_value); /* VULN: overflow */
+        g_config_store[free_slot].in_use = 1;
+        printf("[CFG] created key=%s\n", key);
+    } else {
+        printf("[CFG] store full, update dropped\n");
+    }
+}
+
+/* ---------------------------------------------------------------
+ * 4. Sensor frame processing
+ * BUG: sample_count comes from the wire and is used as the loop
+ *      bound into a fixed-capacity samples[] array without being
+ *      clamped -> out-of-bounds write past sensor_frame_t.samples.
+ * --------------------------------------------------------------- */
+
+void handle_sensor_frame(const uint8_t *raw_frame, size_t raw_len)
+{
+    if (raw_len < 2) {
+        printf("[SENSOR] frame too short\n");
+        return;
+    }
+
+    sensor_frame_t frame;
+    frame.sensor_id     = raw_frame[0];
+    frame.sample_count  = raw_frame[1];
+
+    const uint8_t *sample_src = raw_frame + 2;
+    size_t available_bytes = raw_len - 2;
+
+    /* VULN: frame.sample_count (0-255) is used directly as the
+     * number of int16 samples to read, but frame.samples[] only
+     * holds 8 entries. No clamping against capacity. */
+    for (uint8_t i = 0; i < frame.sample_count; i++) {
+        size_t off = (size_t)i * sizeof(int16_t);
+        if (off + sizeof(int16_t) > available_bytes) {
+            break; /* only guards the read side, not the write side */
+        };
+        int16_t sample;
+        memcpy(&sample, sample_src + off, sizeof(int16_t));
+        frame.samples[i] = sample; /* VULN: OOB write when i >= 8 */
+    }
+
+    printf("[SENSOR] id=%u samples=%u processed\n",
+           frame.sensor_id, frame.sample_count);
+}
+
+/* ---------------------------------------------------------------
+ * 5. Session lifecycle management
+ * BUG A (use-after-free): session_close() frees rx_buffer but a
+ *   later "async-style" callback (session_on_data_callback) still
+ *   uses the stale pointer, mimicking a deferred/queued event
+ *   firing after teardown.
+ * BUG B (double free): session_close() can be invoked twice on
+ *   the same session object (e.g. error path + normal teardown)
+ *   without checking whether it was already freed.
+ * --------------------------------------------------------------- */
+
+session_t *session_open(uint32_t id, size_t buf_len)
+{
+    session_t *s = (session_t *)malloc(sizeof(session_t));
+    if (!s) return NULL;
+
+    s->session_id = id;
+    s->active = 1;
+    s->rx_buffer = (char *)malloc(buf_len);
+    s->rx_buffer_len = buf_len;
+    return s;
+}
+
+void session_close(session_t *s)
+{
+    if (!s) return;
+
+    free(s->rx_buffer);
+    /* VULN: pointer not set to NULL, session not marked inactive
+     * before the free -> enables later use-after-free / double-free */
+    free(s);
+    /* VULN: caller-held handle is now dangling; nothing here
+     * prevents a second session_close(s) call on the same handle */
+}
+
+/* Simulates a queued/async event firing after the session's
+ * teardown request was issued but processed later (e.g. from a
+ * retained callback context or pending task-queue entry). */
+void session_on_data_callback(session_t *s, const char *incoming)
+{
+    /* VULN: no liveness check; if the session was already closed,
+     * s and s->rx_buffer are dangling (use-after-free). */
+    strncpy(s->rx_buffer, incoming, s->rx_buffer_len - 1);
+    s->rx_buffer[s->rx_buffer_len - 1] = '\0';
+    printf("[SESSION %u] rx: %s\n", s->session_id, s->rx_buffer);
+}
+
+/* ---------------------------------------------------------------
+ * 6. OTA metadata / chunk processing
+ * BUG: chunk_len is peer-controlled and used directly as the copy
+ *      length into a fixed-size 'data' buffer -> out-of-bounds
+ *      write. Also demonstrates missing length validation before
+ *      trusting metadata for a firmware update path.
+ * --------------------------------------------------------------- */
+
+void process_ota_metadata(const uint8_t *meta, size_t meta_len,
+                           const uint8_t *chunk_data, size_t chunk_data_len)
+{
+    if (meta_len < sizeof(uint32_t) + sizeof(uint16_t)) {
+        printf("[OTA] metadata too short\n");
+        return;
+    }
+
+    ota_chunk_t chunk;
+    memcpy(&chunk.chunk_offset, meta, sizeof(uint32_t));
+    memcpy(&chunk.chunk_len, meta + sizeof(uint32_t), sizeof(uint16_t));
+
+    /* VULN: chunk.chunk_len (up to 65535) is trusted and copied
+     * into chunk.data[OTA_CHUNK_MAX] without a bounds check. */
+    memcpy(chunk.data, chunk_data, chunk.chunk_len);
+
+    printf("[OTA] offset=%u len=%u applied\n",
+           chunk.chunk_offset, chunk.chunk_len);
+    (void)chunk_data_len; /* realistically should be validated too */
+}
+
+/* ---------------------------------------------------------------
+ * Demo harness
+ * --------------------------------------------------------------- */
+#include <sys/auxv.h>
+
+typedef struct {
+    uint32_t session_id;
+    char    *rx_buffer;
+    size_t   rx_buffer_len;
+} rx_callback_ctx_t;
+
+/* Registrato quando la sessione riceve dati: cattura il buffer
+ * mentre la sessione è ancora viva - come farebbe un vero
+ * completion-callback DMA/interrupt */
+rx_callback_ctx_t session_arm_rx_callback(session_t *s)
+{
+    rx_callback_ctx_t ctx;
+    ctx.session_id     = s->session_id;
+    ctx.rx_buffer       = s->rx_buffer;
+    ctx.rx_buffer_len   = s->rx_buffer_len;
+    return ctx;
+}
+
+void rx_callback_fire(rx_callback_ctx_t *ctx, const char *incoming)
+{
+    /* VULN: nessun controllo che la sessione sia ancora viva */
+    strncpy(ctx->rx_buffer, incoming, ctx->rx_buffer_len - 1);
+    ctx->rx_buffer[ctx->rx_buffer_len - 1] = '\0';
+    printf("[SESSION %u] rx: %s\n", ctx->session_id, ctx->rx_buffer);
+}
+
+int main(void)
+{
+    printf("========= IoT Firmware Memory-Safety Demo (MTE) =========\n\n");
+
+    
+    printf("PR_MTE_TCF_SYNC active: %d\n", prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0));
+    // /*
+    //  * Enable MTE with synchronous checking
+    //  */
+    // if (prctl(PR_SET_TAGGED_ADDR_CTRL,
+    //           PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | (0xfffe << PR_MTE_TAG_SHIFT),
+    //           0, 0, 0))
+    // {
+    //         perror("prctl() failed");
+    //         return EXIT_FAILURE;
+    // }
+    // printf("PR_MTE_TCF_SYNC active: %d\n", prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0));
+
+   
+
+
+
+
+
+
+
+
+
+
+
+    
+
+    /* 1. UART overflow demo (kept within safe bounds by default;
+     *    grow the string to trigger the overflow under a sanitizer) */
+    //uart_process_line("SET_MODE=ACTIVE");
+    uart_process_line("SET_MODE=ACTIVEeeeeeeeeeee");
+    
+    // pkt_header_t hdr = { .magic = 0xABCD, .payload_len = 400, .msg_type = 1 };
+    /* 2. Network packet parsing demo */
+    uint8_t pkt[16] = {0};
+    pkt_header_t hdr = { .magic = 0xABCD, .payload_len = 4, .msg_type = 1 };
+    memcpy(pkt, &hdr, sizeof(hdr));
+    parse_device_message(pkt, sizeof(pkt));
+
+    /* 3. Config update (trigger OOB read + overflow value)
+    uncomment the section for it to "not work"
+    */
+    
+    // /* key NOT terminated with '\0' (trigger OOB read via strncmp) */
+    // char bad_key[4] = { 'W','I','F','I' }; //less then 16 and without \0
+
+    // /* new_value too long (trigger OOB write with strcpy) */
+    // char bad_value[CONFIG_VAL_MAX + 32]; // 32 byte over the limit
+    // memset(bad_value, 'B', sizeof(bad_value));
+    // bad_value[sizeof(bad_value) - 1] = '\0'; // \0 so that strcopy reat untill the end
+    
+    //apply_config_update(bad_key, bad_value);
+
+    apply_config_update("wifi_ssid", "MyHomeNetwork"); //ok values
+
+    /* 4. Sensor frame demo (sample_count kept small here) */
+    uint8_t sensor_raw[2 + 4 * sizeof(int16_t)] = {0};
+    sensor_raw[0] = 0x01; /* sensor_id */
+    sensor_raw[1] = 0x04; /* sample_count = 4, within capacity */
+    //sensor_raw[10] = 0x04; /* sample_count > 8 => OOB write */
+    handle_sensor_frame(sensor_raw, sizeof(sensor_raw));
+
+
+
+
+
+    /* 5. Session lifecycle demo */
+    // session_t *s = session_open(42, 64);
+    // session_on_data_callback(s, "hello device");
+    // session_close(s);
+    // /* Uncomment to demonstrate use-after-free under MTE:*/
+    //  session_on_data_callback(s, "late callback"); 
+    /* Uncomment to demonstrate double-free under MTE:*/
+      //session_close(s); 
+
+
+    session_t *s = session_open(42, 64);
+    rx_callback_ctx_t pending = session_arm_rx_callback(s);  /* IRQ armato mentre s è vivo */
+    session_close(s);                                         /* teardown */
+    rx_callback_fire(&pending, "late callback");               /* IRQ tardivo -> UAF */
+
+
+
+
+    /* 6. OTA metadata demo */
+    uint8_t ota_meta[6];
+    uint32_t offset = 0;
+    uint16_t len = 8;
+    memcpy(ota_meta, &offset, sizeof(offset));
+    memcpy(ota_meta + sizeof(offset), &len, sizeof(len));
+    uint8_t ota_data[8] = {1,2,3,4,5,6,7,8};
+    process_ota_metadata(ota_meta, sizeof(ota_meta), ota_data, sizeof(ota_data));
+
+    printf("\n=== Demo complete. Edit main() or inputs to trigger each bug. ===\n");
+    return 0;
+}
