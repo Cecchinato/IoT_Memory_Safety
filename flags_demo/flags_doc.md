@@ -11,6 +11,8 @@ on bare-metal Cortex-M a hand-written `__cfi_check` runtime would be required).
 
 ## 1. Canary (`-fstack-protector-strong`)
 
+Canaries or canary words or stack cookies are known values that are placed between a buffer and control data on the stack to monitor buffer overflows. When the buffer overflows, the first data to be corrupted will usually be the canary, and a failed verification of the canary data will therefore alert of an overflow, which can then be handled, for example, by invalidating the corrupted data.
+
 ```bash
 cd flags_demo
 
@@ -23,14 +25,21 @@ west build -d build_hard_canary -t run
 # *** stack smashing detected ***: terminated
 ```
 
-Verify the canary is actually present in the binary:
+Without stack protector we are not sure that the program stops with a segfault.
+In fact, if the overflow does not overwrite the return address (e.g. another variable) or if it overwrites it with a valid address, the execution of the program continues normally.
 
-```bash
-nm build_hard_canary/zephyr/zephyr.elf | grep stack_chk
-# should show __stack_chk_fail / __stack_chk_guard
-```
+Note: Canary are checked at the return of a function and NOT during the Overflow
+
 
 ## 2. FORTIFY_SOURCE (`-D_FORTIFY_SOURCE=2`)
+
+FORTIFY_SOURCE is a feature available in the GNU C Library that provides runtime protection against certain types of security vulnerabilities. Specifically, FORTIFY_SOURCE detects and prevents buffer overflow and formats string vulnerabilities, which are two common types of vulnerabilities that attackers can exploit to take control of a system or steal sensitive data.
+
+FORTIFY_SOURCE works by providing enhanced versions of certain C library functions that can detect when a buffer overflow or format string vulnerability is about to occur. When a vulnerable function is called, FORTIFY_SOURCE checks the size of the buffer being used and ensures that it is not being overrun. If an overflow or vulnerability is detected, FORTIFY_SOURCE immediately terminates the program to prevent further damage.
+
+When using FORTIFY_SOURCE, you can specify a level of protection between 0 and 3. The higher the level, the more security features are enabled. The default level is 1.
+
+See this [article](https://developers.redhat.com/articles/2023/07/04/developers-guide-secure-coding-fortifysource#how_to_use_fortify_source) for a more detailed explanetion
 
 ```bash
 west build -b native_sim/native/64 -d build_vuln_fortify . -- -DHARDENED=OFF -DDEMO=fortify
@@ -42,21 +51,21 @@ west build -d build_hard_fortify -t run
 # *** buffer overflow detected *** / abort from __chk_fail
 ```
 
-```bash
-nm build_hard_fortify/zephyr/zephyr.elf | grep _chk
-# should show __strcpy_chk (or similar)
-```
+
 
 Note: picolibc is required (already in `prj.conf`) because Zephyr's minimal
 libc does not implement the fortified `*_chk` variants.
 
 ## 3. Control Flow Integrity
 
+Clang includes an implementation of a number of control flow integrity (CFI) schemes, which are designed to abort the program upon detecting certain forms of undefined behavior that can potentially allow attackers to subvert the program’s control flow. These schemes have been optimized for performance, allowing developers to enable them in release builds.
+
 Requires the Zephyr LLVM toolchain:
 
 ```bash
 west sdk install   # if not already done, make sure llvm is included
-
+```
+```bash
 west build -b native_sim/native/64 -d build_vuln_cfi \
     -- -DHARDENED=OFF -DDEMO=cfi -DZEPHYR_TOOLCHAIN_VARIANT=llvm
 west build -d build_vuln_cfi -t run
@@ -68,29 +77,29 @@ west build -d build_hard_cfi -t run
 # illegal instruction / "CFI failure": the call is blocked before it is executed
 ```
 
-```bash
-nm build_hard_cfi/zephyr/zephyr.elf | grep cfi_check
-```
+
 
 ## 4. Warning-as-error (`-Wall -Wextra -Werror -Wformat-security`)
 
 This flag acts **at compile-time**, not at runtime: in `src/main.c`
-there is a commented-out line (`printk(payload);` instead of
-`printk("%s", payload);`). Uncomment it and try:
+there is a commented-out line (`printf(payload);` instead of
+`printf("%s", payload);`). Uncomment it and try:
 
 ```bash
-west build -b native_sim/native/64 -d build_werror . -- -DHARDENED=ON -DDEMO=canary
+west build -b native_sim/native/64 -d build_werror . -- -DHARDENED=ON -DDEMO=warnings
+
+west build -b native_sim/native/64 -d build_werror . -- -DHARDENED=OFF -DDEMO=warnings
 ```
 
 With `HARDENED=ON` the build fails immediately for a non-literal format string
 (`-Wformat-security`), before even producing a binary.
 With `HARDENED=OFF` it compiles without a word – the bug would reach production.
 
-## Flag → Defense Summary
+## Summary
 
 | Flag | Bug class blocked | When it acts |
 |---|---|---|
 | `-fstack-protector-strong` | stack buffer overflow → return address overwrite | runtime (on function exit) |
 | `-D_FORTIFY_SOURCE=2` | overflow on string.h functions with size known to the compiler | runtime (inside the call) |
-| `-Wformat-security` (+`-Werror`) | format string bug | compile-time |
+| `-Wformat-security` (with `-Werror`) | format string bug | compile-time |
 | `-fsanitize=cfi` | function pointer / vtable hijacking | runtime (at indirect call) |
