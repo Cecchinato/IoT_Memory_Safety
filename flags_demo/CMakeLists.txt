@@ -72,7 +72,8 @@ elseif(DEMO STREQUAL "cfi")
     if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
       message(FATAL_ERROR
         "DEMO=cfi with HARDENED=ON requires the LLVM toolchain: add "
-        "-DZEPHYR_TOOLCHAIN_VARIANT=llvm to the west build command")
+        "-DZEPHYR_TOOLCHAIN_VARIANT=host/llvm -DCONFIG_LLVM_USE_LLD=y "
+        "to the west build command")
     endif()
     message(STATUS "*** HARDENED: -fsanitize=cfi (DEMO=cfi) ***")
     target_compile_options(app PRIVATE -fsanitize=cfi -flto -fvisibility=hidden)

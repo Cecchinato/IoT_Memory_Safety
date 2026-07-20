@@ -67,15 +67,22 @@ west sdk install   # if not already done, make sure llvm is included
 ```
 ```bash
 west build -b native_sim/native/64 -d build_vuln_cfi \
-    -- -DHARDENED=OFF -DDEMO=cfi -DZEPHYR_TOOLCHAIN_VARIANT=llvm
+    -- -DHARDENED=OFF -DDEMO=cfi -DZEPHYR_TOOLCHAIN_VARIANT=host/llvm
 west build -d build_vuln_cfi -t run
 # the call with the wrong type succeeds (or crashes unpredictably) – no protection
 
 west build -b native_sim/native/64 -d build_hard_cfi \
-    -- -DHARDENED=ON -DDEMO=cfi -DZEPHYR_TOOLCHAIN_VARIANT=llvm
+    -- -DHARDENED=ON -DDEMO=cfi -DZEPHYR_TOOLCHAIN_VARIANT=host/llvm -DCONFIG_LLVM_USE_LLD=y
 west build -d build_hard_cfi -t run
 # illegal instruction / "CFI failure": the call is blocked before it is executed
 ```
+
+Note: for native_sim/POSIX boards, `-DZEPHYR_TOOLCHAIN_VARIANT=llvm` alone is silently
+overridden back to the host GCC toolchain (see `cmake/modules/FindHostTools.cmake`) –
+it must be `host/llvm`. `-DCONFIG_LLVM_USE_LLD=y` is also required: the LLVM toolchain
+defaults to linking with `ld.bfd`, which cannot read the LLVM bitcode objects produced
+by `-flto` (needed by CFI), and the link fails with
+`member ... in archive is not an object`.
 
 
 
