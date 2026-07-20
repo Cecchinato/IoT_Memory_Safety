@@ -64,7 +64,7 @@ west build -p always -b native_sim my_app -d build_asan
 - `-p always` forces a pristine build (useful after changes to `prj.conf`/`CMakeLists.txt`).
 - `-d build_asan` puts the output in a dedicated directory, so you can keep an ASan build separate from a production build for the real board.
 
-### Note: native_sim by defoult use 32-bit libraries
+### Note: native_sim by default use 32-bit libraries
 
 Therefore you can either:
 
@@ -82,7 +82,7 @@ west build -p always -b native_sim/native/64 my_app -d build_asan
 
 ## Run
 
-You can run the progect via west:
+You can run the project via west:
 ```bash
 BUG_TEST=<TEST> west build -t run -d build_asan
 ```

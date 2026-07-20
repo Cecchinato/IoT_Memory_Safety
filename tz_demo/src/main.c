@@ -1,10 +1,17 @@
 /*
- * build_b: TrustZone ENABLED, this is the non-secure image.
+ * TrustZone demo, non-secure image.
  *
  * TF-M boots first as the secure world, sets up the SAU/IDAU, then hands
- * control to this Zephyr image running non-secure. Any secret the secure
- * side owns is simply not addressable from here, the CPU enforces that
- * in hardware before the access ever reaches memory.
+ * control to this Zephyr image running non-secure. This single app stores
+ * the same secret two different ways and shows what happens when
+ * non-secure code tries to reach each one:
+ *   1. Through the PSA Protected Storage API, which TF-M backs with
+ *      secure-side storage - the correct approach.
+ *   2. As a plain non-secure global, readable by anything running in
+ *      this image regardless of TrustZone.
+ *   3. A direct, non-secure read into a hardcoded secure-flash address,
+ *      to show that the SAU fault is triggered by the address range
+ *      alone, independent of what secret (if any) actually lives there.
  *
  * On the MPS2+ AN521, the same physical flash and RAM are mapped twice:
  * once at the "normal" address for NS, and once again at
@@ -65,18 +72,18 @@ static void untrusted_read_attempt(void)
 
 int main(void)
 {
-	printk("\n\n=== build_b: Key saved in TrustZone ===\n");
+	printk("\n\n=== Key saved via PSA Protected Storage (secure world) ===\n");
 
 	printk("[DBG] TrustZone is: ");
 	#if defined(CONFIG_ARM_TRUSTZONE_M)
-    	printk("enabled\n");
+		printk("enabled\n");
 	#else
 		printk("disabled\n");
 	#endif
 
 	legit_key_storage();
 
-	printk("\n=== build_b: Key not saved in TrustZone ===\n");
+	printk("\n=== Key kept as a plain non-secure global (no protection) ===\n");
 	printk("[DBG] key lives at %p\n", (void *)key);
 	printk("[untrusted code] key = ");
 
@@ -85,8 +92,8 @@ int main(void)
 	}
 
 	printk("\n[untrusted code] done.\n");
-	
-	printk("\n=== build_b: Accessing the key saved in the TrustZone ===\n");
+
+	printk("\n=== Direct non-secure access to a secure-flash address ===\n");
 	untrusted_read_attempt();
 	
 	return 0;
