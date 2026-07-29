@@ -17,19 +17,6 @@ the protection catches it.
 | **UBSan** | UndefinedBehaviorSanitizer — signed overflow, bad shifts, misaligned loads, invalid loads; the one sanitizer here that also runs on the real target | `native_sim` **and** `mps2/an385` (QEMU) | [ubsan_doc.md](./ubsan_demo/ubsan_doc.md) |
 | **Hardening flags** | Stack canary, `_FORTIFY_SOURCE`, CFI, `-Wformat-security` — four compiler/linker flags, vulnerable vs. hardened | `native_sim` | [flags_doc.md](./flags_demo/flags_doc.md) |
 
-### Shared bug set
-
-The ASan demo's `main.c` defines six bug categories: stack overflow,
-unvalidated packet length, config-store overflow, sensor out-of-bounds
-write, session use-after-free/double-free, and OTA chunk overflow. The MTE
-demo reuses that same code, unmodified, to run the identical bugs through
-a second, independent detection mechanism — so the two demos are directly
-comparable, bug for bug.
-
-The UBSan demo deliberately does **not** reuse it. Undefined behavior is a
-different failure mode from memory corruption: of its eight bugs, only the
-out-of-bounds array index is something ASan would also catch. It keeps its
-own `main.c` for that reason.
 
 
 
