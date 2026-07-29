@@ -1,7 +1,7 @@
 # Embedded Security Demonstrations on Zephyr
 
 Six self-contained demos. Each one pairs a classic embedded bug with a
-specific hardware- or compiler-level protection, so you can see exactly
+specific hardware or compiler-level protection, so you can see exactly
 what the bug looks like unprotected, and exactly what happens the moment
 the protection catches it.
 
